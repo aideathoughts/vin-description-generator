@@ -407,7 +407,6 @@ def _init_session_state() -> None:
         "price_input": "",
         "title_status_input": "",
         "condition_note_input": "",
-        "condition_report_file": None,
         "condition_report_text": "",
         "condition_report_parse_message": "",
         "last_generation_source": "",
