@@ -1,4 +1,5 @@
 import datetime as dt
+import io
 import json
 import os
 import sqlite3
@@ -12,6 +13,11 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 
 DB_PATH = "vehicles.db"
@@ -45,6 +51,7 @@ class VehicleInput:
     price: str
     title_status: str
     condition_note: str
+    condition_report_text: str = ""
     year: str = ""
     make: str = ""
     model: str = ""
@@ -154,6 +161,9 @@ def _vehicle_data_block(vehicle: VehicleInput) -> str:
     for label, value in optional_lines:
         if value and value.strip():
             vehicle_data_lines.append(f"{label}: {value.strip()}")
+    if vehicle.condition_report_text and vehicle.condition_report_text.strip():
+        vehicle_data_lines.append("Condition Report Text:")
+        vehicle_data_lines.append(vehicle.condition_report_text.strip()[:3500])
     return "\n".join(vehicle_data_lines)
 
 
@@ -178,6 +188,9 @@ If no price/down payment is provided, omit any pricing section completely.
 Do not include placeholders like "N/A", "unknown", or blank labels.
 If a field value is missing, omit that field entirely.
 When condition note is provided, naturally include it in the description.
+When condition report text is provided, use it to improve accuracy and sales wording.
+Use condition report details as supporting facts, but keep the final output concise and buyer-friendly.
+If VIN, mileage, or other fields are missing in form inputs, infer them from condition report text when clearly available.
 Create a fresh variation each time this prompt is run.
 Variation token: {variation_token}
 If there is a previous description, write a meaningfully different version with new phrasing and structure.
@@ -198,6 +211,7 @@ Do not add claims that are not supported by the provided data.
 Do not use a "key features" section.
 Do not use placeholders like N/A.
 When condition note is provided, naturally include it.
+When condition report text is provided, use it to preserve key factual details while improving wording.
 Keep it around 120-190 words.
 Variation token: {variation_token}
 
@@ -223,7 +237,7 @@ def generate_description(
         if OpenAI is None:
             raise RuntimeError("OpenAI package is not available in this runtime. Reinstall dependencies and restart.")
         if not api_key:
-            raise RuntimeError("No OpenAI API key detected. Paste your key in the sidebar field.")
+            raise RuntimeError("No OpenAI API key detected in environment/secrets.")
     if api_key and OpenAI is not None:
         try:
             client = OpenAI(api_key=api_key)
@@ -306,6 +320,11 @@ def fallback_description(vehicle: VehicleInput) -> str:
         description_lines.append(f"Color: {vehicle.color}")
     if vehicle.title_status:
         description_lines.append(f"Title: {vehicle.title_status}")
+    if vehicle.condition_note:
+        description_lines.append(f"Condition Note: {vehicle.condition_note}")
+    if vehicle.condition_report_text:
+        report_highlight = " ".join(vehicle.condition_report_text.split())[:320]
+        description_lines.append(f"Condition Report: {report_highlight}")
 
     pricing_lines = []
     if vehicle.price:
@@ -388,6 +407,9 @@ def _init_session_state() -> None:
         "price_input": "",
         "title_status_input": "",
         "condition_note_input": "",
+        "condition_report_file": None,
+        "condition_report_text": "",
+        "condition_report_parse_message": "",
         "last_generation_source": "",
         "last_generation_error": "",
         "generation_mode_input": "New Text Generation",
@@ -398,6 +420,52 @@ def _init_session_state() -> None:
             st.session_state[key] = value
 
 
+def _extract_condition_report_text(uploaded_file) -> tuple[str, str]:
+    if uploaded_file is None:
+        return "", ""
+
+    try:
+        raw_bytes = uploaded_file.getvalue()
+    except Exception as exc:
+        return "", f"Could not read uploaded file: {exc}"
+
+    if not raw_bytes:
+        return "", "Condition report file is empty."
+
+    file_name = (getattr(uploaded_file, "name", "") or "").lower()
+    if file_name.endswith(".pdf"):
+        if PdfReader is None:
+            return "", "PDF parsing unavailable. Install `pypdf` to read PDF reports."
+        try:
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            pages = []
+            for page in reader.pages:
+                page_text = (page.extract_text() or "").strip()
+                if page_text:
+                    pages.append(page_text)
+            full_text = "\n".join(pages).strip()
+            if not full_text:
+                return "", "PDF uploaded, but no readable text was found."
+            return full_text[:7000], ""
+        except Exception as exc:
+            return "", f"Failed to parse PDF condition report: {exc}"
+
+    decoded_text = ""
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            decoded_text = raw_bytes.decode(encoding)
+            break
+        except Exception:
+            continue
+    if not decoded_text:
+        return "", "Could not decode file text. Please upload a PDF or plain text file."
+
+    cleaned_text = decoded_text.replace("\x00", " ").strip()
+    if not cleaned_text:
+        return "", "Uploaded text file has no readable content."
+    return cleaned_text[:7000], ""
+
+
 def _build_vehicle_from_inputs() -> VehicleInput:
     vin = st.session_state.get("vin_input", "").strip().upper()
     mileage = st.session_state.get("mileage_input", "").strip()
@@ -406,8 +474,14 @@ def _build_vehicle_from_inputs() -> VehicleInput:
     price = st.session_state.get("price_input", "").strip()
     title_status = st.session_state.get("title_status_input", "").strip()
     condition_note = st.session_state.get("condition_note_input", "").strip()
+    condition_report_file = st.session_state.get("condition_report_file")
+    condition_report_text, report_message = _extract_condition_report_text(condition_report_file)
+    st.session_state["condition_report_text"] = condition_report_text
+    st.session_state["condition_report_parse_message"] = report_message
 
-    decoded = decode_vin(vin)
+    decoded = {}
+    if vin:
+        decoded = decode_vin(vin)
     return VehicleInput(
         vin=vin,
         mileage=mileage,
@@ -416,6 +490,7 @@ def _build_vehicle_from_inputs() -> VehicleInput:
         price=price,
         title_status=title_status,
         condition_note=condition_note,
+        condition_report_text=condition_report_text,
         year=decoded.get("year", ""),
         make=decoded.get("make", ""),
         model=decoded.get("model", ""),
@@ -446,7 +521,10 @@ def _generate_and_store_from_current_inputs(generation_mode: str, paraphrase_tex
 
 def render_editor_page() -> None:
     st.subheader("VIN Description Editor")
-    st.caption("Use one click to generate or paraphrase. Output appears right below the form.")
+    st.caption(
+        "Use one click to generate or paraphrase. Output appears right below the form. "
+        "You can generate from condition report + pricing only."
+    )
 
     with st.form("vehicle_form"):
         st.text_input("VIN", max_chars=17, key="vin_input")
@@ -469,16 +547,23 @@ def render_editor_page() -> None:
             st.text_input("Price", placeholder="$14,500", key="price_input")
             st.text_input("Title Status", placeholder="Clean Title", key="title_status_input")
             st.text_area("Condition Note", placeholder="Runs and drives well.", key="condition_note_input")
+            st.file_uploader(
+                "Condition Report File (PDF or text)",
+                key="condition_report_file",
+                help="Attach a PDF or text file. The model will read it and use it to improve the description.",
+            )
         submitted = st.form_submit_button("Generate Description")
 
     if submitted:
         vin = st.session_state.get("vin_input", "").strip()
         mileage = st.session_state.get("mileage_input", "").strip()
-        if not vin:
-            st.error("VIN is required.")
+        condition_report_file = st.session_state.get("condition_report_file")
+        has_condition_report = condition_report_file is not None
+        if not vin and not has_condition_report:
+            st.error("Enter VIN or upload a condition report file.")
             return
-        if not mileage:
-            st.error("Mileage is required.")
+        if not mileage and not has_condition_report:
+            st.error("Enter mileage or upload a condition report file that includes mileage.")
             return
 
         selected_mode = st.session_state.get("generation_mode_input", "New Text Generation")
@@ -493,6 +578,10 @@ def render_editor_page() -> None:
             with st.spinner("Decoding VIN and generating description..."):
                 _generate_and_store_from_current_inputs(generation_mode, paraphrase_text)
             st.success("Description generated.")
+            if st.session_state.get("condition_report_text"):
+                st.caption("Condition report text loaded and included in generation.")
+            if st.session_state.get("condition_report_parse_message"):
+                st.warning(st.session_state.get("condition_report_parse_message"))
             st.caption("VIN data is sourced from NHTSA vPIC and should be verified before posting.")
         except Exception as exc:
             st.session_state["last_generation_error"] = str(exc)
